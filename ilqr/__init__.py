@@ -15,6 +15,7 @@
 """Iterative Linear Quadratic Regulator."""
 
 from . import autodiff, cost, dynamics
-from .controller import iLQR, RecedingHorizonController
+from .controller import RecedingHorizonController, iLQR
+from .wheeled_hopper_dynamics import WheeledHopperDynamics
 
 __all__ = ["iLQR", "RecedingHorizonController", "autodiff", "cost", "dynamics"]

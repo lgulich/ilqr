@@ -14,15 +14,18 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>
 """Controllers."""
 
-import six
 import abc
+import time
 import warnings
+
 import numpy as np
+import six
+
+from joblib import Parallel, delayed
 
 
 @six.add_metaclass(abc.ABCMeta)
 class BaseController():
-
     """Base trajectory optimizer controller."""
 
     @abc.abstractmethod
@@ -42,11 +45,28 @@ class BaseController():
         raise NotImplementedError
 
 
-class iLQR(BaseController):
+class LinModParams:
+    """Parameter struct for the linearization of the model and the cost function"""
 
+    def __init__(self, x, F_x, F_u, L, L_x, L_u, L_xx, L_ux, L_uu):
+        self.x = x
+        self.F_x = F_x
+        self.F_u = F_u
+        self.L = L
+        self.L_x = L_x
+        self.L_u = L_u
+        self.L_xx = L_xx
+        self.L_ux = L_ux
+        self.L_uu = L_uu
+
+    def getParams(self):
+        return self.x, self.F_x, self.F_u, self.L, self.L_x, self.L_u, self.L_xx, self.L_ux, self.L_uu
+
+
+class iLQR(BaseController):
     """Finite Horizon Iterative Linear Quadratic Regulator."""
 
-    def __init__(self, dynamics, cost, N, max_reg=1e10, hessians=False):
+    def __init__(self, dynamics, cost, N, max_reg=1e10, hessians=False, n_jobs=1):
         """Constructs an iLQR solver.
 
         Args:
@@ -63,6 +83,7 @@ class iLQR(BaseController):
         self.cost = cost
         self.N = N
         self._use_hessians = hessians and dynamics.has_hessians
+        self.n_jobs = n_jobs
         if hessians and not dynamics.has_hessians:
             warnings.warn("hessians requested but are unavailable in dynamics")
 
@@ -79,7 +100,7 @@ class iLQR(BaseController):
 
         super(iLQR, self).__init__()
 
-    def fit(self, x0, us_init, n_iterations=100, tol=1e-6, on_iteration=None):
+    def fit(self, x0, us_init, n_iterations=100, tol=1e-6, on_iteration=None, interim_log=False):
         """Computes the optimal controls.
 
         Args:
@@ -122,10 +143,18 @@ class iLQR(BaseController):
 
             # Forward rollout only if it needs to be recomputed.
             if changed:
-                (xs, F_x, F_u, L, L_x, L_u, L_xx, L_ux, L_uu, F_xx, F_ux,
+                (xs, F_x, F_u, Ls, L_x, L_u, L_xx, L_ux, L_uu, F_xx, F_ux,
                  F_uu) = self._forward_rollout(x0, us)
-                J_opt = L.sum()
+                J_opt = Ls.sum()
                 changed = False
+
+            if interim_log and iteration == 0:
+                self.dynamics.log_interim(
+                    xs,
+                    us,
+                    self.cost.getXGoal(),
+                    self.cost.getCostSequence(xs, us, Ls),
+                    0)
 
             try:
                 # Backward pass.
@@ -171,6 +200,14 @@ class iLQR(BaseController):
             if on_iteration:
                 on_iteration(iteration, xs, us, J_opt, accepted, converged)
 
+            if interim_log:
+                self.dynamics.log_interim(
+                    xs,
+                    us,
+                    self.cost.getXGoal(),
+                    self.cost.getCostSequence(xs, us, Ls),
+                    iteration + 1)
+
             if converged:
                 break
 
@@ -180,7 +217,7 @@ class iLQR(BaseController):
         self._nominal_xs = xs
         self._nominal_us = us
 
-        return xs, us
+        return xs, us, Ls
 
     def _control(self, xs, us, k, K, alpha=1.0):
         """Applies the controls for a given trajectory.
@@ -282,25 +319,27 @@ class iLQR(BaseController):
         L_uu = np.empty((N, action_size, action_size))
 
         xs[0] = x0
+
+        # forward evaluation of state sequence
         for i in range(N):
             x = xs[i]
             u = us[i]
 
             xs[i + 1] = self.dynamics.f(x, u, i)
-            F_x[i] = self.dynamics.f_x(x, u, i)
-            F_u[i] = self.dynamics.f_u(x, u, i)
-
-            L[i] = self.cost.l(x, u, i, terminal=False)
-            L_x[i] = self.cost.l_x(x, u, i, terminal=False)
-            L_u[i] = self.cost.l_u(x, u, i, terminal=False)
-            L_xx[i] = self.cost.l_xx(x, u, i, terminal=False)
-            L_ux[i] = self.cost.l_ux(x, u, i, terminal=False)
-            L_uu[i] = self.cost.l_uu(x, u, i, terminal=False)
 
             if self._use_hessians:
                 F_xx[i] = self.dynamics.f_xx(x, u, i)
                 F_ux[i] = self.dynamics.f_ux(x, u, i)
                 F_uu[i] = self.dynamics.f_uu(x, u, i)
+
+        # parallelized forward evaluation of linearization
+        res = Parallel(n_jobs=self.n_jobs)(delayed(self._forward_rollout_core)(
+            xs[i], us[i], i) for i in range(N))
+        # res = [self._forward_rollout_core(xs[i], us[i], i) for i in range(N)]
+
+        # unpack linmodparams object
+        for i in range(N):
+            _, F_x[i], F_u[i], L[i], L_x[i], L_u[i], L_xx[i], L_ux[i], L_uu[i] = res[i].getParams()
 
         x = xs[-1]
         L[-1] = self.cost.l(x, None, N, terminal=True)
@@ -308,6 +347,27 @@ class iLQR(BaseController):
         L_xx[-1] = self.cost.l_xx(x, None, N, terminal=True)
 
         return xs, F_x, F_u, L, L_x, L_u, L_xx, L_ux, L_uu, F_xx, F_ux, F_uu
+
+    def _forward_rollout_core(self, x, u, i):
+        """
+        in: x, u
+        out: F_x, F_u, L, L_x, L_u, L_xx, L_ux, L_uu
+        """
+        F_x = self.dynamics.f_x(x, u, i)
+        F_u = self.dynamics.f_u(x, u, i)
+
+        L = self.cost.l(x, u, i, terminal=False)
+        L_x = self.cost.l_x(x, u, i, terminal=False)
+        L_u = self.cost.l_u(x, u, i, terminal=False)
+        L_xx = self.cost.l_xx(x, u, i, terminal=False)
+        L_ux = self.cost.l_ux(x, u, i, terminal=False)
+        L_uu = self.cost.l_uu(x, u, i, terminal=False)
+        res = LinModParams(x, F_x, F_u, L, L_x, L_u, L_xx, L_ux, L_uu)
+
+        if self._use_hessians:
+            raise NotImplementedError
+
+        return res
 
     def _backward_pass(self,
                        F_x,
@@ -436,7 +496,6 @@ class iLQR(BaseController):
 
 
 class RecedingHorizonController(object):
-
     """Receding horizon controller for Model Predictive Control."""
 
     def __init__(self, x0, controller):

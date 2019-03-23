@@ -14,11 +14,15 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>
 """Instantaneous Cost Function."""
 
-import six
 import abc
+
 import numpy as np
-import theano.tensor as T
+import six
+from scipy.linalg import block_diag
 from scipy.optimize import approx_fprime
+
+import theano.tensor as T
+
 from .autodiff import as_function, hessian_scalar, jacobian_scalar
 
 
@@ -782,6 +786,9 @@ class QRCost(Cost):
 
         super(QRCost, self).__init__()
 
+    def getXGoal(self):
+        return self.x_goal
+
     def l(self, x, u, i, terminal=False):
         """Instantaneous cost function.
 
@@ -914,7 +921,7 @@ class PathQRCost(Cost):
             self.Q_terminal = np.array(Q_terminal)
 
         if u_path is None:
-            self.u_path = np.zeros(path_length - 1, action_size)
+            self.u_path = np.zeros((path_length - 1, action_size))
         else:
             self.u_path = np.array(u_path)
 
@@ -924,7 +931,7 @@ class PathQRCost(Cost):
         assert state_size == self.x_path.shape[1], "Q & x_path mismatch"
         assert action_size == self.u_path.shape[1], "R & u_path mismatch"
         assert path_length == self.u_path.shape[0] + 1, \
-                "x_path must be 1 longer than u_path"
+            "x_path must be 1 longer than u_path"
 
         # Precompute some common constants.
         self._Q_plus_Q_T = self.Q + self.Q.T
@@ -932,6 +939,29 @@ class PathQRCost(Cost):
         self._Q_plus_Q_T_terminal = self.Q_terminal + self.Q_terminal.T
 
         super(PathQRCost, self).__init__()
+
+    def getXGoal(self):
+        return self.x_path
+
+    def getCostSequence(self, xs, us, Ls):
+        state_size = self.Q.shape[0]
+        action_size = self.R.shape[0]
+        path_length = self.x_path.shape[0]
+        all_costs = np.zeros((path_length, state_size + action_size))
+        x_diff = xs - self.x_path
+
+        # get costs of state
+        for i in range(state_size):
+            all_costs[:, i] = ((x_diff[:, i])**2 * self.Q[i, i])
+
+        # get costs of inputs
+        for i in range(action_size):
+            all_costs[:-1, i + state_size] = ((us[:, i])**2 * self.R[i, i])
+
+        all_costs = np.concatenate(
+            (Ls.reshape(path_length, 1), all_costs), axis=1)
+
+        return all_costs
 
     def l(self, x, u, i, terminal=False):
         """Instantaneous cost function.
@@ -1034,3 +1064,173 @@ class PathQRCost(Cost):
             return np.zeros_like(self.R)
 
         return self._R_plus_R_T
+
+
+class TimeDependentPathQRCost(Cost):
+
+    """Quadratic Regulator Instantaneous Cost for trajectory following."""
+
+    def __init__(self, Q, R, x_path, u_path=None):
+        """Constructs a QRCost.
+
+        Args:
+            Q: Quadratic state cost matrix [N+1, state_size, state_size].
+            R: Quadratic control cost matrix [N, action_size, action_size].
+            x_path: Goal state path [N+1, state_size].
+            u_path: Goal control path [N, action_size].
+            Q_terminal: Terminal quadratic state cost matrix
+                [state_size, state_size].
+        """
+        self.Q = np.array(Q)
+        self.R = np.array(R)
+        self.x_path = np.array(x_path)
+
+        state_size = self.Q.shape[1]
+        action_size = self.R.shape[1]
+        path_length = self.x_path.shape[0]
+
+        if u_path is None:
+            self.u_path = np.zeros((path_length - 1, action_size))
+        else:
+            self.u_path = np.array(u_path)
+
+        assert self.Q.shape[1] == self.Q.shape[2], "Q must be square"
+        assert self.R.shape[1] == self.R.shape[2], "R must be square"
+        assert state_size == self.x_path.shape[1], "Q & x_path mismatch"
+        assert action_size == self.u_path.shape[1], "R & u_path mismatch"
+        assert path_length == self.u_path.shape[0] + \
+            1, "x_path must be 1 longer than u_path"
+        assert path_length == self.Q.shape[0], "Q must be of size (N+1, n_x, n_x)"
+        assert path_length == self.R.shape[0] + \
+            1, "R must be of size (N, n_u, n_u)"
+
+        # Precompute some common constants.
+        self._Q_plus_Q_T = self.Q + np.transpose(self.Q, (0, 2, 1))
+        self._R_plus_R_T = self.R + np.transpose(self.R, (0, 2, 1))
+        super(TimeDependentPathQRCost, self).__init__()
+
+    def getXGoal(self):
+        return self.x_path
+
+    def getCostSequence(self, xs, us, Ls):
+        state_size = self.Q.shape[-1]
+        action_size = self.R.shape[-1]
+        path_length = self.x_path.shape[0]
+        all_costs = np.zeros((path_length, state_size + action_size))
+        x_diff = xs - self.x_path
+
+        # get seperate costs of each state
+        for i in range(state_size):
+            all_costs[:, i] = x_diff[:, i]**2 * self.Q[:, i, i]
+
+        # get seperate costs of each input
+        for i in range(action_size):
+            all_costs[:-1, i +
+                      state_size] = us[:, i]**2 * self.R[:, i, i]
+
+        all_costs = np.concatenate(
+            (Ls.reshape(path_length, 1), all_costs), axis=1)
+
+        return all_costs
+
+    def l(self, x, u, i, terminal=False):
+        """Instantaneous cost function.
+
+        Args:
+            x: Current state [state_size].
+            u: Current control [action_size]. None if terminal.
+            i: Current time step.
+            terminal: Compute terminal cost. Default: False.
+
+        Returns:
+            Instantaneous cost (scalar).
+        """
+        Q = self.Q[i, :, :]
+        x_diff = x - self.x_path[i]
+        squared_x_cost = x_diff.T.dot(Q).dot(x_diff)
+
+        if terminal:
+            return squared_x_cost
+
+        R = self.R[i, :, :]
+        u_diff = u - self.u_path[i]
+        return squared_x_cost + u_diff.T.dot(R).dot(u_diff)
+
+    def l_x(self, x, u, i, terminal=False):
+        """Partial derivative of cost function with respect to x.
+
+        Args:
+            x: Current state [state_size].
+            u: Current control [action_size]. None if terminal.
+            i: Current time step.
+            terminal: Compute terminal cost. Default: False.
+
+        Returns:
+            dl/dx [state_size].
+        """
+        Q_plus_Q_T = self._Q_plus_Q_T[i, :, :]
+        x_diff = x - self.x_path[i]
+        return x_diff.T.dot(Q_plus_Q_T)
+
+    def l_u(self, x, u, i, terminal=False):
+        """Partial derivative of cost function with respect to u.
+
+        Args:
+            x: Current state [state_size].
+            u: Current control [action_size]. None if terminal.
+            i: Current time step.
+            terminal: Compute terminal cost. Default: False.
+
+        Returns:
+            dl/du [action_size].
+        """
+        if terminal:
+            return np.zeros_like(self.u_path)
+
+        u_diff = u - self.u_path[i]
+        return u_diff.T.dot(self._R_plus_R_T[i, :, :])
+
+    def l_xx(self, x, u, i, terminal=False):
+        """Second partial derivative of cost function with respect to x.
+
+        Args:
+            x: Current state [state_size].
+            u: Current control [action_size]. None if terminal.
+            i: Current time step.
+            terminal: Compute terminal cost. Default: False.
+
+        Returns:
+            d^2l/dx^2 [state_size, state_size].
+        """
+        return self._Q_plus_Q_T[i]
+
+    def l_ux(self, x, u, i, terminal=False):
+        """Second partial derivative of cost function with respect to u and x.
+
+        Args:
+            x: Current state [state_size].
+            u: Current control [action_size]. None if terminal.
+            i: Current time step.
+            terminal: Compute terminal cost. Default: False.
+
+        Returns:
+            d^2l/dudx [action_size, state_size].
+        """
+        return np.zeros((self.R.shape[1], self.Q.shape[1]))
+
+    def l_uu(self, x, u, i, terminal=False):
+        """Second partial derivative of cost function with respect to u.
+
+        Args:
+            x: Current state [state_size].
+            u: Current control [action_size]. None if terminal.
+            i: Current time step.
+            terminal: Compute terminal cost. Default: False.
+
+        Returns:
+            d^2l/du^2 [action_size, action_size].
+        """
+        if terminal:
+            return np.zeros_like(self.R[0])
+
+        return self._R_plus_R_T[i]

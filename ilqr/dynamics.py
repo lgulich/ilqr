@@ -14,12 +14,15 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>
 """Dynamics model."""
 
-import six
 import abc
-import theano
+
 import numpy as np
-import theano.tensor as T
+import six
 from scipy.optimize import approx_fprime
+
+import theano
+import theano.tensor as T
+
 from .autodiff import (as_function, batch_jacobian, hessian_vector,
                        jacobian_vector)
 
@@ -141,6 +144,10 @@ class Dynamics():
         Returns:
             d^2f/du^2 [state_size, action_size, action_size].
         """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def log_interim(self, xs, us):
         raise NotImplementedError
 
 

@@ -1,7 +1,7 @@
-import matplotlib.pyplot as plt
-
 import autograd.numpy as np
+import matplotlib.pyplot as plt
 from autograd import elementwise_grad, grad, jacobian
+
 from ilqr.dynamics import Dynamics
 from wheeled_hopper.logger import Logger
 from wheeled_hopper.wheeled_hopper_nucleus import WheeledHopperNucleus
@@ -108,5 +108,8 @@ class WheeledHopperDynamics(Dynamics):
         if not self._has_hessians:
             raise NotImplementedError
 
-    def log_interim(self, xs, us, x_goal, Ls,  iter):
-        Logger.log_complete(xs, us, x_goal, Ls, 'ilqr', iter)
+    def log_interim(self, xs, us, Ls, x_goal=None, Qs=None, Rs=None, iter=None):
+        if x_goal is None:
+            Logger.log_complete_update(xs, us, Ls, 'ilqr', iter)
+        else:
+            Logger.log_complete(xs, us, x_goal, Ls, Qs, Rs, 'ilqr', iter)

@@ -150,11 +150,13 @@ class iLQR(BaseController):
 
             if interim_log and iteration == 0:
                 self.dynamics.log_interim(
-                    xs,
-                    us,
-                    self.cost.getXGoal(),
-                    self.cost.getCostSequence(xs, us, Ls),
-                    0)
+                    xs=xs,
+                    us=us,
+                    Ls=self.cost.getCostSequence(xs, us, Ls),
+                    x_goal=self.cost.getXGoal(),
+                    Qs=self.cost.getQs(),
+                    Rs=self.cost.getRs(),
+                    iter=0)
 
             try:
                 # Backward pass.
@@ -184,10 +186,12 @@ class iLQR(BaseController):
                         # Accept this.
                         accepted = True
                         break
+
             except np.linalg.LinAlgError as e:
                 # Quu was not positive-definite and this diverged.
                 # Try again with a higher regularization term.
                 warnings.warn(str(e))
+                asdf
 
             if not accepted:
                 # Increase regularization term.
@@ -202,11 +206,10 @@ class iLQR(BaseController):
 
             if interim_log:
                 self.dynamics.log_interim(
-                    xs,
-                    us,
-                    self.cost.getXGoal(),
-                    self.cost.getCostSequence(xs, us, Ls),
-                    iteration + 1)
+                    xs=xs,
+                    us=us,
+                    Ls=self.cost.getCostSequence(xs, us, Ls),
+                    iter=iteration + 1)
 
             if converged:
                 break
@@ -242,7 +245,7 @@ class iLQR(BaseController):
             # Eq (12).
             # Applying alpha only on k[i] as in the paper for some reason
             # doesn't converge.
-            us_new[i] = us[i] + alpha * (k[i] + K[i].dot(xs_new[i] - xs[i]))
+            us_new[i] = us[i] + alpha * (k[i]) + K[i].dot(xs_new[i] - xs[i])
 
             # Eq (8c).
             xs_new[i + 1] = self.dynamics.f(xs_new[i], us_new[i], i)

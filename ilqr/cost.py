@@ -963,6 +963,12 @@ class PathQRCost(Cost):
 
         return all_costs
 
+    def getQs(self):
+        return self.Qs
+
+    def getRs(self):
+        return self.Rs
+
     def l(self, x, u, i, terminal=False):
         """Instantaneous cost function.
 
@@ -1070,7 +1076,7 @@ class TimeDependentPathQRCost(Cost):
 
     """Quadratic Regulator Instantaneous Cost for trajectory following."""
 
-    def __init__(self, Q, R, x_path, u_path=None):
+    def __init__(self, Qs, Rs, x_path, u_path=None):
         """Constructs a QRCost.
 
         Args:
@@ -1081,12 +1087,12 @@ class TimeDependentPathQRCost(Cost):
             Q_terminal: Terminal quadratic state cost matrix
                 [state_size, state_size].
         """
-        self.Q = np.array(Q)
-        self.R = np.array(R)
+        self.Qs = np.array(Qs)
+        self.Rs = np.array(Rs)
         self.x_path = np.array(x_path)
 
-        state_size = self.Q.shape[1]
-        action_size = self.R.shape[1]
+        state_size = self.Qs.shape[1]
+        action_size = self.Rs.shape[1]
         path_length = self.x_path.shape[0]
 
         if u_path is None:
@@ -1094,44 +1100,50 @@ class TimeDependentPathQRCost(Cost):
         else:
             self.u_path = np.array(u_path)
 
-        assert self.Q.shape[1] == self.Q.shape[2], "Q must be square"
-        assert self.R.shape[1] == self.R.shape[2], "R must be square"
+        assert self.Qs.shape[1] == self.Qs.shape[2], "Q must be square"
+        assert self.Rs.shape[1] == self.Rs.shape[2], "R must be square"
         assert state_size == self.x_path.shape[1], "Q & x_path mismatch"
         assert action_size == self.u_path.shape[1], "R & u_path mismatch"
         assert path_length == self.u_path.shape[0] + \
             1, "x_path must be 1 longer than u_path"
-        assert path_length == self.Q.shape[0], "Q must be of size (N+1, n_x, n_x)"
-        assert path_length == self.R.shape[0] + \
+        assert path_length == self.Qs.shape[0], "Q must be of size (N+1, n_x, n_x)"
+        assert path_length == self.Rs.shape[0] + \
             1, "R must be of size (N, n_u, n_u)"
 
         # Precompute some common constants.
-        self._Q_plus_Q_T = self.Q + np.transpose(self.Q, (0, 2, 1))
-        self._R_plus_R_T = self.R + np.transpose(self.R, (0, 2, 1))
+        self._Q_plus_Q_T = self.Qs + np.transpose(self.Qs, (0, 2, 1))
+        self._R_plus_R_T = self.Rs + np.transpose(self.Rs, (0, 2, 1))
         super(TimeDependentPathQRCost, self).__init__()
 
     def getXGoal(self):
         return self.x_path
 
     def getCostSequence(self, xs, us, Ls):
-        state_size = self.Q.shape[-1]
-        action_size = self.R.shape[-1]
+        state_size = self.Qs.shape[-1]
+        action_size = self.Rs.shape[-1]
         path_length = self.x_path.shape[0]
         all_costs = np.zeros((path_length, state_size + action_size))
         x_diff = xs - self.x_path
 
         # get seperate costs of each state
         for i in range(state_size):
-            all_costs[:, i] = x_diff[:, i]**2 * self.Q[:, i, i]
+            all_costs[:, i] = x_diff[:, i]**2 * self.Qs[:, i, i]
 
         # get seperate costs of each input
         for i in range(action_size):
             all_costs[:-1, i +
-                      state_size] = us[:, i]**2 * self.R[:, i, i]
+                      state_size] = us[:, i]**2 * self.Rs[:, i, i]
 
         all_costs = np.concatenate(
             (Ls.reshape(path_length, 1), all_costs), axis=1)
 
         return all_costs
+
+    def getQs(self):
+        return self.Qs
+
+    def getRs(self):
+        return self.Rs
 
     def l(self, x, u, i, terminal=False):
         """Instantaneous cost function.
@@ -1145,14 +1157,14 @@ class TimeDependentPathQRCost(Cost):
         Returns:
             Instantaneous cost (scalar).
         """
-        Q = self.Q[i, :, :]
+        Q = self.Qs[i, :, :]
         x_diff = x - self.x_path[i]
         squared_x_cost = x_diff.T.dot(Q).dot(x_diff)
 
         if terminal:
             return squared_x_cost
 
-        R = self.R[i, :, :]
+        R = self.Rs[i, :, :]
         u_diff = u - self.u_path[i]
         return squared_x_cost + u_diff.T.dot(R).dot(u_diff)
 
@@ -1216,7 +1228,7 @@ class TimeDependentPathQRCost(Cost):
         Returns:
             d^2l/dudx [action_size, state_size].
         """
-        return np.zeros((self.R.shape[1], self.Q.shape[1]))
+        return np.zeros((self.Rs.shape[1], self.Qs.shape[1]))
 
     def l_uu(self, x, u, i, terminal=False):
         """Second partial derivative of cost function with respect to u.
@@ -1231,6 +1243,222 @@ class TimeDependentPathQRCost(Cost):
             d^2l/du^2 [action_size, action_size].
         """
         if terminal:
-            return np.zeros_like(self.R[0])
+            return np.zeros_like(self.Rs[0])
+
+        return self._R_plus_R_T[i]
+
+
+class TimeDependentBoundedPathQRCost(Cost):
+
+    """Quadratic Regulator Instantaneous Cost for trajectory following."""
+
+    def __init__(self, Qs, Rs, x_path, x_l_bounds, x_u_bounds, Q_bound, u_path=None):
+        """Constructs a QRCost.
+
+        Args:
+            Q: Quadratic state cost matrix [N+1, state_size, state_size].
+            R: Quadratic control cost matrix [N, action_size, action_size].
+            x_path: Goal state path [N+1, state_size].
+            x_l_bounds: Lower bounds for state [state_size, ].
+            x_u_bounds: Upper bounds for state [state_size, ].
+            Q_bound: Quadratic state cost matrix for outside bounds [state_size, state_size].
+            u_path: Goal control path [N, action_size].
+        """
+        self.Qs = np.array(Qs)
+        self.Rs = np.array(Rs)
+        self.x_path = np.array(x_path)
+        self.x_l_bounds = np.array(x_l_bounds)
+        self.x_u_bounds = np.array(x_u_bounds)
+        self.Q_bound = np.array(Q_bound)
+
+        state_size = self.Qs.shape[1]
+        action_size = self.Rs.shape[1]
+        path_length = self.x_path.shape[0]
+
+        if u_path is None:
+            self.u_path = np.zeros((path_length - 1, action_size))
+        else:
+            self.u_path = np.array(u_path)
+
+        assert self.Qs.shape[1] == self.Qs.shape[2], "Q must be square"
+        assert self.Rs.shape[1] == self.Rs.shape[2], "R must be square"
+        assert self.Q_bound.shape[0] == self.Q_bound.shape[1], "Q bound must be square"
+        assert state_size == self.x_path.shape[1], "Q & x_path mismatch"
+        assert state_size == self.Q_bound.shape[0], "Q_bound must be of same dimension as Q"
+        assert state_size == self.x_l_bounds.shape[0], "x_l_bounds must be of dimension state_size"
+        assert state_size == self.x_u_bounds.shape[0], "x_u_bounds must be of dimension state_size"
+        assert action_size == self.u_path.shape[1], "R & u_path mismatch"
+        assert path_length == self.u_path.shape[0] + \
+            1, "x_path must be 1 longer than u_path"
+        assert path_length == self.Qs.shape[0], "Q must be of size (N+1, n_x, n_x)"
+        assert path_length == self.Rs.shape[0] + \
+            1, "R must be of size (N, n_u, n_u)"
+
+        # Precompute some common constants.
+        self._Q_plus_Q_T = self.Qs + np.transpose(self.Qs, (0, 2, 1))
+        self._Q_plus_Q_T_bound = self.Q_bound + np.transpose(self.Q_bound)
+        self._R_plus_R_T = self.Rs + np.transpose(self.Rs, (0, 2, 1))
+        super(TimeDependentBoundedPathQRCost, self).__init__()
+
+    def getXGoal(self):
+        return self.x_path
+
+    def getCostSequence(self, xs, us, Ls):
+        # TODO update with new cost
+        state_size = self.Qs.shape[-1]
+        action_size = self.Rs.shape[-1]
+        path_length = self.x_path.shape[0]
+        all_costs = np.zeros((path_length, state_size + action_size))
+        x_diff = xs - self.x_path
+
+        # get seperate costs of each state
+        for i in range(state_size):
+            all_costs[:, i] = x_diff[:, i]**2 * self.Qs[:, i, i]
+
+        # get seperate costs of each input
+        for i in range(action_size):
+            all_costs[:-1, i +
+                      state_size] = us[:, i]**2 * self.Rs[:, i, i]
+
+        all_costs = np.concatenate(
+            (Ls.reshape(path_length, 1), all_costs), axis=1)
+
+        return all_costs
+
+    def getQs(self):
+        return self.Qs
+
+    def getRs(self):
+        return self.Rs
+
+    def getXOutBounds(self, x):
+        """Absolute value of the part of the state which lies outside the bounds
+
+        Returns:
+            x_diff_bounds [state_size]
+
+        """
+        state_size = self.Qs.shape[-1]
+
+        x_over_bounds = np.maximum(
+            np.zeros(state_size, ), x - self.x_u_bounds)
+        x_under_bounds = np.maximum(
+            np.zeros(state_size, ), self.x_l_bounds - x)
+        return x_over_bounds + x_under_bounds
+
+    def l(self, x, u, i, terminal=False):
+        """Instantaneous cost function.
+
+        Args:
+            x: Current state [state_size].
+            u: Current control [action_size]. None if terminal.
+            i: Current time step.
+            terminal: Compute terminal cost. Default: False.
+
+        Returns:
+            Instantaneous cost (scalar).
+        """
+        Q = self.Qs[i, :, :]
+        x_diff = x - self.x_path[i]
+        squared_x_cost = x_diff.T.dot(Q).dot(x_diff)
+
+        x_out_bounds = self.getXOutBounds(x)
+
+        bounds_cost = x_out_bounds.T.dot(self.Q_bound).dot(x_out_bounds)
+
+        if terminal:
+            return squared_x_cost + bounds_cost
+
+        R = self.Rs[i, :, :]
+        u_diff = u - self.u_path[i]
+        return squared_x_cost + u_diff.T.dot(R).dot(u_diff) + bounds_cost
+
+    def l_x(self, x, u, i, terminal=False):
+        """Partial derivative of cost function with respect to x.
+
+        Args:
+            x: Current state [state_size].
+            u: Current control [action_size]. None if terminal.
+            i: Current time step.
+            terminal: Compute terminal cost. Default: False.
+
+        Returns:
+            dl/dx [state_size].
+        """
+        x_out_bounds = self.getXOutBounds(x)
+        bounds_cost = x_out_bounds.T.dot(self._Q_plus_Q_T_bound)
+
+        Q_plus_Q_T = self._Q_plus_Q_T[i, :, :]
+        x_diff = x - self.x_path[i]
+        return x_diff.T.dot(Q_plus_Q_T) + bounds_cost
+
+    def l_u(self, x, u, i, terminal=False):
+        """Partial derivative of cost function with respect to u.
+
+        Args:
+            x: Current state [state_size].
+            u: Current control [action_size]. None if terminal.
+            i: Current time step.
+            terminal: Compute terminal cost. Default: False.
+
+        Returns:
+            dl/du [action_size].
+        """
+        if terminal:
+            return np.zeros_like(self.u_path)
+
+        u_diff = u - self.u_path[i]
+        return u_diff.T.dot(self._R_plus_R_T[i, :, :])
+
+    def l_xx(self, x, u, i, terminal=False):
+        """Second partial derivative of cost function with respect to x.
+
+        Args:
+            x: Current state [state_size].
+            u: Current control [action_size]. None if terminal.
+            i: Current time step.
+            terminal: Compute terminal cost. Default: False.
+
+        Returns:
+            d^2l/dx^2 [state_size, state_size].
+        """
+        x_out_bounds = self.getXOutBounds(x)
+
+        if np.sum(x_out_bounds) > 0:
+            bounds_cost = self._Q_plus_Q_T_bound
+
+        else:
+            bounds_cost = np.zeros_like(self._Q_plus_Q_T_bound)
+
+        return self._Q_plus_Q_T[i] + bounds_cost
+
+    def l_ux(self, x, u, i, terminal=False):
+        """Second partial derivative of cost function with respect to u and x.
+
+        Args:
+            x: Current state [state_size].
+            u: Current control [action_size]. None if terminal.
+            i: Current time step.
+            terminal: Compute terminal cost. Default: False.
+
+        Returns:
+            d^2l/dudx [action_size, state_size].
+        """
+        return np.zeros((self.Rs.shape[1], self.Qs.shape[1]))
+
+    def l_uu(self, x, u, i, terminal=False):
+        """Second partial derivative of cost function with respect to u.
+
+        Args:
+            x: Current state [state_size].
+            u: Current control [action_size]. None if terminal.
+            i: Current time step.
+            terminal: Compute terminal cost. Default: False.
+
+        Returns:
+            d^2l/du^2 [action_size, action_size].
+        """
+        if terminal:
+            return np.zeros_like(self.Rs[0])
 
         return self._R_plus_R_T[i]

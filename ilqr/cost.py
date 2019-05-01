@@ -1308,7 +1308,7 @@ class TimeDependentBoundedPathQRCost(Cost):
         state_size = self.Qs.shape[-1]
         action_size = self.Rs.shape[-1]
         path_length = self.x_path.shape[0]
-        all_costs = np.zeros((path_length, state_size + action_size))
+        all_costs = np.zeros((path_length, 2 * state_size + action_size))
         x_diff = xs - self.x_path
 
         # get seperate costs of each state
@@ -1320,6 +1320,15 @@ class TimeDependentBoundedPathQRCost(Cost):
             all_costs[:-1, i +
                       state_size] = us[:, i]**2 * self.Rs[:, i, i]
 
+        # get seperate costs of each input for the boundary restriction
+        bound_costs = np.zeros((path_length, state_size))
+        for i in range(path_length):
+            x_out_bounds = self.getXOutBounds(xs[i, :])
+            for j in range(state_size):
+                bound_costs[i, j] = x_out_bounds[j]**2 * self.Q_bound[j, j]
+        all_costs[:, state_size + action_size:] = bound_costs
+
+        # prepend total costs to individual costs
         all_costs = np.concatenate(
             (Ls.reshape(path_length, 1), all_costs), axis=1)
 

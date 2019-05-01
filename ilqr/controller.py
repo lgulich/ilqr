@@ -20,7 +20,6 @@ import warnings
 
 import numpy as np
 import six
-
 from joblib import Parallel, delayed
 
 
@@ -100,7 +99,56 @@ class iLQR(BaseController):
 
         super(iLQR, self).__init__()
 
-    def fit(self, x0, us_init, n_iterations=100, tol=1e-6, on_iteration=None, interim_log=False):
+    def initWithLqr(self, k, K, N, x0, x_set):
+        action_size = self.dynamics.action_size
+        state_size = self.dynamics.state_size
+
+        assert k.shape == (action_size,), f'k of wrong shape: {k.shape}'
+        assert K.shape == (
+            action_size, state_size), f'K of wrong shape: {K.shape}'
+        x = x0
+        us = np.zeros((N, action_size))
+
+        for i in range(self.N):
+            us[i] = us[i] + k + K.dot(x - x_set)
+            x = self.dynamics.f(x, us[i], i)
+
+        return us
+
+    def linearizeAroundEquilibrium(self, x_eq, u_eq, n):
+        """
+        linearize the model around the equilibrium and return the optimal feedback and feedforward matrices
+
+        Args:
+            x_eq: equilibrium state [state_size]
+            us_eq: equilibrium input [action_size]
+            n: timestep to linearize about
+
+        Returns:
+            Tuple of
+                k: feedforward gain
+                K: feedback gain
+        """
+        assert x_eq.shape[0] == self.dynamics.state_size, "x_eq of wrong shape"
+        assert u_eq.shape[0] == self.dynamics.action_size, "u_eq of wrong shape"
+        assert n < self.N, "n too big"
+        assert np.array_equal(x_eq, self.dynamics.f(
+            x_eq, u_eq, n)), "not in an euilibrium state"
+
+        us = np.tile(u_eq, (self.N, 1))
+
+        (xs, F_x, F_u, Ls, L_x, L_u, L_xx, L_ux, L_uu,
+         F_xx, F_ux, F_uu) = self._forward_rollout(x_eq, us)
+
+        # Backward pass.
+        k, K = self._backward_pass(F_x, F_u, L_x, L_u, L_xx, L_ux, L_uu,
+                                   F_xx, F_ux, F_uu)
+
+        return k[n], K[n]
+        # np.savetxt('k_ff.csv', k[50], delimiter=',')
+        # np.savetxt('K_fb.csv', K[50], delimiter=',')
+
+    def fit(self, x0, us_init, n_iterations=100, tol=1e-6, abs_tol=200, on_iteration=None, interim_log=False):
         """Computes the optimal controls.
 
         Args:
@@ -108,6 +156,7 @@ class iLQR(BaseController):
             us_init: Initial control path [N, action_size].
             n_iterations: Maximum number of interations. Default: 100.
             tol: Tolerance. Default: 1e-6.
+            abs_tol: absolute tolerance, default: 200
             on_iteration: Callback at the end of each iteration with the
                 following signature:
                 (iteration_count, x, J_opt, accepted, converged) -> None
@@ -163,13 +212,19 @@ class iLQR(BaseController):
                 k, K = self._backward_pass(F_x, F_u, L_x, L_u, L_xx, L_ux, L_uu,
                                            F_xx, F_ux, F_uu)
 
+                # save k and K if needed
+                # if iteration == 0:
+                #     np.savetxt('k_ff.csv', k[50], delimiter=',')
+                #     np.savetxt('K_fb.csv', K[50], delimiter=',')
+                # asd
+
                 # Backtracking line search.
                 for alpha in alphas:
                     xs_new, us_new = self._control(xs, us, k, K, alpha)
                     J_new = self._trajectory_cost(xs_new, us_new)
 
                     if J_new < J_opt:
-                        if np.abs((J_opt - J_new) / J_opt) < tol:
+                        if (np.abs((J_opt - J_new) / J_opt) < tol) and (np.abs(J_opt - J_new) < abs_tol):
                             converged = True
 
                         J_opt = J_new
@@ -191,7 +246,6 @@ class iLQR(BaseController):
                 # Quu was not positive-definite and this diverged.
                 # Try again with a higher regularization term.
                 warnings.warn(str(e))
-                asdf
 
             if not accepted:
                 # Increase regularization term.
@@ -245,7 +299,7 @@ class iLQR(BaseController):
             # Eq (12).
             # Applying alpha only on k[i] as in the paper for some reason
             # doesn't converge.
-            us_new[i] = us[i] + alpha * (k[i]) + K[i].dot(xs_new[i] - xs[i])
+            us_new[i] = us[i] + alpha * k[i] + K[i].dot(xs_new[i] - xs[i])
 
             # Eq (8c).
             xs_new[i + 1] = self.dynamics.f(xs_new[i], us_new[i], i)
@@ -338,7 +392,6 @@ class iLQR(BaseController):
         # parallelized forward evaluation of linearization
         res = Parallel(n_jobs=self.n_jobs)(delayed(self._forward_rollout_core)(
             xs[i], us[i], i) for i in range(N))
-        # res = [self._forward_rollout_core(xs[i], us[i], i) for i in range(N)]
 
         # unpack linmodparams object
         for i in range(N):
@@ -438,6 +491,9 @@ class iLQR(BaseController):
 
         return np.array(k), np.array(K)
 
+    def getControlMatrices(self):
+        return self._k, self._K
+
     def _Q(self,
            f_x,
            f_u,
@@ -496,6 +552,27 @@ class iLQR(BaseController):
             Q_uu += np.tensordot(V_x, f_uu, axes=1)
 
         return Q_x, Q_u, Q_xx, Q_ux, Q_uu
+
+    @staticmethod
+    def saveTrajForRos(xs, us, dt, fname):
+        """
+        filestructure:
+        ts, x1s, x2s , ... , u1s u2s
+        -------
+        0, 1.5
+        0.1, 1.6
+        0.2, 1.7
+        """
+
+        N = us.shape[0]
+        t_s = np.arange(0, dt * N, dt).reshape((N, 1))
+
+        # print(t_s, h_s, hip_torque_s)
+        all = np.concatenate((t_s, xs[:-1, :], us), axis=1)
+
+        np.savetxt(fname, all, delimiter=',')
+
+        return
 
 
 class RecedingHorizonController(object):

@@ -17,5 +17,7 @@
 from . import autodiff, cost, dynamics
 from .controller import RecedingHorizonController, iLQR
 from .wheeled_hopper_dynamics import WheeledHopperDynamics
+from .wheeled_hopper_dynamics_body_based import WheeledHopperDynamicsBodyBased
 
-__all__ = ["iLQR", "RecedingHorizonController", "autodiff", "cost", "dynamics"]
+__all__ = ["iLQR", "RecedingHorizonController", "autodiff", "cost",
+           "dynamics", "WheeledHopperDynamics", "WheeledHopperDynamicsBodyBased"]

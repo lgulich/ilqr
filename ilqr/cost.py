@@ -18,12 +18,11 @@ import abc
 
 import numpy as np
 import six
+import theano.tensor as T
 from scipy.linalg import block_diag
 from scipy.optimize import approx_fprime
 
-import theano.tensor as T
-
-from .autodiff import as_function, hessian_scalar, jacobian_scalar
+from autodiff import as_function, hessian_scalar, jacobian_scalar
 
 
 @six.add_metaclass(abc.ABCMeta)
@@ -1439,6 +1438,318 @@ class TimeDependentBoundedPathQRCost(Cost):
         else:
             bounds_cost = np.zeros_like(self._Q_plus_Q_T_bound)
 
+        return self._Q_plus_Q_T[i] + bounds_cost
+
+    def l_ux(self, x, u, i, terminal=False):
+        """Second partial derivative of cost function with respect to u and x.
+
+        Args:
+            x: Current state [state_size].
+            u: Current control [action_size]. None if terminal.
+            i: Current time step.
+            terminal: Compute terminal cost. Default: False.
+
+        Returns:
+            d^2l/dudx [action_size, state_size].
+        """
+        return np.zeros((self.Rs.shape[1], self.Qs.shape[1]))
+
+    def l_uu(self, x, u, i, terminal=False):
+        """Second partial derivative of cost function with respect to u.
+
+        Args:
+            x: Current state [state_size].
+            u: Current control [action_size]. None if terminal.
+            i: Current time step.
+            terminal: Compute terminal cost. Default: False.
+
+        Returns:
+            d^2l/du^2 [action_size, action_size].
+        """
+        if terminal:
+            return np.zeros_like(self.Rs[0])
+
+        return self._R_plus_R_T[i]
+
+
+class TimeDependentLogBoundedPathQRCost(Cost):
+
+    """Quadratic Regulator Instantaneous Cost for trajectory following."""
+
+    def __init__(self, Qs, Rs, x_path, x_l_bounds, x_u_bounds, Q_bound, u_path=None):
+        """Constructs a QRCost.
+
+        Args:
+            Q: Quadratic state cost matrix [N+1, state_size, state_size].
+            R: Quadratic control cost matrix [N, action_size, action_size].
+            x_path: Goal state path [N+1, state_size].
+            x_l_bounds: Lower bounds for state [state_size, ].
+            x_u_bounds: Upper bounds for state [state_size, ].
+            Q_bound: Quadratic state cost matrix for outside bounds [state_size, state_size].
+            u_path: Goal control path [N, action_size].
+        """
+        self.Qs = np.array(Qs)
+        self.Rs = np.array(Rs)
+        self.x_path = np.array(x_path)
+        self.x_l_bounds = np.array(x_l_bounds)
+        self.x_u_bounds = np.array(x_u_bounds)
+        self.Q_bound = np.array(Q_bound)
+
+        state_size = self.Qs.shape[1]
+        action_size = self.Rs.shape[1]
+        path_length = self.x_path.shape[0]
+
+        if u_path is None:
+            self.u_path = np.zeros((path_length - 1, action_size))
+        else:
+            self.u_path = np.array(u_path)
+
+        assert self.Qs.shape[1] == self.Qs.shape[2], "Q must be square"
+        assert self.Rs.shape[1] == self.Rs.shape[2], "R must be square"
+        assert self.Q_bound.shape[0] == self.Q_bound.shape[1], "Q bound must be square"
+        assert state_size == self.x_path.shape[1], "Q & x_path mismatch"
+        assert state_size == self.Q_bound.shape[0], "Q_bound must be of same dimension as Q"
+        assert state_size == self.x_l_bounds.shape[0], "x_l_bounds must be of dimension state_size"
+        assert state_size == self.x_u_bounds.shape[0], "x_u_bounds must be of dimension state_size"
+        assert action_size == self.u_path.shape[1], "R & u_path mismatch"
+        assert path_length == self.u_path.shape[0] + \
+            1, "x_path must be 1 longer than u_path"
+        assert path_length == self.Qs.shape[0], "Q must be of size (N+1, n_x, n_x)"
+        assert path_length == self.Rs.shape[0] + \
+            1, "R must be of size (N, n_u, n_u)"
+
+        # Precompute some common constants.
+        self._Q_plus_Q_T = self.Qs + np.transpose(self.Qs, (0, 2, 1))
+        self._Q_plus_Q_T_bound = self.Q_bound + np.transpose(self.Q_bound)
+        self._R_plus_R_T = self.Rs + np.transpose(self.Rs, (0, 2, 1))
+        super(TimeDependentLogBoundedPathQRCost, self).__init__()
+
+    def getXGoal(self):
+        return self.x_path
+
+    def getCostSequence(self, xs, us, Ls):
+        state_size = self.Qs.shape[-1]
+        action_size = self.Rs.shape[-1]
+        path_length = self.x_path.shape[0]
+        all_costs = np.zeros((path_length, 2 * state_size + action_size))
+        x_diff = xs - self.x_path
+
+        # get seperate costs of each state
+        for i in range(state_size):
+            all_costs[:, i] = x_diff[:, i]**2 * self.Qs[:, i, i]
+
+        # get seperate costs of each input
+        for i in range(action_size):
+            all_costs[:-1, i +
+                      state_size] = us[:, i]**2 * self.Rs[:, i, i]
+
+        # get seperate costs of each input for the boundary restriction
+        bound_costs = np.zeros((path_length, state_size))
+        for i in range(path_length):
+            for j in range(state_size):
+                bound_costs[i, j] += self.log_barrier(
+                    xs[i, j], self.x_u_bounds[j], 1)
+                bound_costs[i, j] += self.log_barrier(
+                    xs[i, j], self.x_l_bounds[j], -1)
+
+        all_costs[:, state_size + action_size:] = bound_costs
+
+        # prepend total costs to individual costs
+        all_costs = np.concatenate(
+            (Ls.reshape(path_length, 1), all_costs), axis=1)
+
+        return all_costs
+
+    def getQs(self):
+        return self.Qs
+
+    def getRs(self):
+        return self.Rs
+
+    @staticmethod
+    def log_barrier(x, b, direction=1, weight=1.0, d=0.0005):
+        """
+        a logarithmic cost barrier which smoothly transitions into a linear barrier
+
+        Arguments
+        ---------
+        x(float): the real value
+        b(float): position of barrer
+        direction(int): strength of barrier, if negative lower bound barrier, if positive upper bound barrier
+        d(float): the absolute distance of switch from log to linear, has to be positive,  defaults to 0.005
+
+        Returns:
+        --------
+        (float): the barrier cost
+        """
+        direction = np.sign(direction)
+        # calculate position of barrier switch
+        s = b - direction * np.abs(d)
+        if direction * x < direction * s:
+            return (- np.log(direction * (b - x))) * weight
+        else:
+            m = 1.0 / (b - s)
+            q = -np.log(direction * (b - s)) - m * s
+            return (m * x + q) * weight
+
+    @staticmethod
+    def log_barrier_x(x, b, direction=1, weight=1.0, d=0.0005):
+        """
+        partial derivative of log-barrier with respect to x
+
+        Arguments
+        ---------
+        x(float): the real value
+        b(float): position of barrer
+        direction(int): direction of barrier, if negative lower bound barrier, if positive upper bound barrier
+        d(float): the absolute distance of switch from log to linear, has to be between 0 and 1, defaults to 0.005
+
+        Returns:
+        --------
+        (float): the barrier cost
+        """
+        direction = np.sign(direction)
+        s = b - direction * np.abs(d)
+        if direction * x < direction * s:
+            return weight / (b - x)
+        else:
+            m = 1.0 / (b - s)
+            return m * weight
+
+    @staticmethod
+    def log_barrier_xx(x, b, direction=1, weight=1.0, d=0.0005):
+        """
+        second partial derivative of log-barrier with respect to x
+
+        Arguments
+        ---------
+        x(float): the real value
+        b(float): position of barrer
+        direction(int): direction of barrier, if negative lower bound barrier, if positive upper bound barrier
+        d(float): the absolute distance of switch from log to linear, has to be between 0 and 1, defaults to 0.999
+
+        Returns:
+        --------
+        (float): the barrier cost
+        """
+        direction = np.sign(direction)
+        s = b - direction * np.abs(d)
+        if direction * x < direction * s:
+            return weight / ((b - x)**2)
+        else:
+            return 0
+
+    def bounds_cost(self, x, u, i, terminal=False):
+        state_size = self.Qs.shape[1]
+        bounds_cost = 0.0
+        for j in range(state_size):
+            bounds_cost += self.log_barrier(x[j],
+                                            self.x_u_bounds[j], +1, self.Q_bound[j, j])
+            bounds_cost += self.log_barrier(x[j],
+                                            self.x_l_bounds[j], -1, self.Q_bound[j, j])
+            # assert not np.isnan(bounds_cost), f'found nan in l: {x[i]} {self.x_l_bounds[i]} {self.x_u_bounds[i]}'
+            assert not np.isnan(bounds_cost)
+        return bounds_cost
+
+    def bounds_cost_x(self, x, u, i, terminal=False):
+        state_size = self.Qs.shape[1]
+        bounds_cost = np.zeros((state_size,))
+
+        for j in range(state_size):
+            bounds_cost[j] += self.log_barrier_x(x[j],
+                                                 self.x_u_bounds[j], +1, self.Q_bound[j, j])
+            bounds_cost[j] += self.log_barrier_x(x[j],
+                                                 self.x_l_bounds[j], -1, self.Q_bound[j, j])
+            assert not np.isnan(bounds_cost[j]), "found nan in l_x"
+
+        return bounds_cost
+
+    def bounds_cost_xx(self, x, u, i, terminal=False):
+        state_size = self.Qs.shape[1]
+        bounds_cost = np.zeros((state_size, state_size))
+        for j in range(state_size):
+            bounds_cost[j, j] += self.log_barrier_xx(
+                x[j], self.x_u_bounds[j], +1, self.Q_bound[j, j])
+            bounds_cost[j, j] += self.log_barrier_xx(
+                x[j], self.x_l_bounds[j], -1, self.Q_bound[j, j])
+            assert not np.isnan(bounds_cost[j, j]), "found nan in l_xx"
+
+        return bounds_cost
+
+    def l(self, x, u, i, terminal=False):
+        """Instantaneous cost function.
+
+        Args:
+            x: Current state [state_size].
+            u: Current control [action_size]. None if terminal.
+            i: Current time step.
+            terminal: Compute terminal cost. Default: False.
+
+        Returns:
+            Instantaneous cost (scalar).
+        """
+        Q = self.Qs[i, :, :]
+        x_diff = x - self.x_path[i]
+        squared_x_cost = x_diff.T.dot(Q).dot(x_diff)
+
+        state_size = self.Qs.shape[1]
+        bounds_cost = self.bounds_cost(x, u, i, terminal)
+
+        if terminal:
+            return squared_x_cost + bounds_cost
+
+        R = self.Rs[i, :, :]
+        u_diff = u - self.u_path[i]
+        return squared_x_cost + u_diff.T.dot(R).dot(u_diff) + bounds_cost
+
+    def l_x(self, x, u, i, terminal=False):
+        """Partial derivative of cost function with respect to x.
+
+        Args:
+            x: Current state [state_size].
+            u: Current control [action_size]. None if terminal.
+            i: Current time step.
+            terminal: Compute terminal cost. Default: False.
+
+        Returns:
+            dl/dx [state_size].
+        """
+        bounds_cost = self.bounds_cost_x(x, u, i, terminal)
+        Q_plus_Q_T = self._Q_plus_Q_T[i, :, :]
+        x_diff = x - self.x_path[i]
+        return x_diff.T.dot(Q_plus_Q_T) + bounds_cost
+
+    def l_u(self, x, u, i, terminal=False):
+        """Partial derivative of cost function with respect to u.
+
+        Args:
+            x: Current state [state_size].
+            u: Current control [action_size]. None if terminal.
+            i: Current time step.
+            terminal: Compute terminal cost. Default: False.
+
+        Returns:
+            dl/du [action_size].
+        """
+        if terminal:
+            return np.zeros_like(self.u_path)
+
+        u_diff = u - self.u_path[i]
+        return u_diff.T.dot(self._R_plus_R_T[i, :, :])
+
+    def l_xx(self, x, u, i, terminal=False):
+        """Second partial derivative of cost function with respect to x.
+
+        Args:
+            x: Current state [state_size].
+            u: Current control [action_size]. None if terminal.
+            i: Current time step.
+            terminal: Compute terminal cost. Default: False.
+
+        Returns:
+            d^2l/dx^2 [state_size, state_size].
+        """
+        bounds_cost = self.bounds_cost_xx(x, u, i, terminal)
         return self._Q_plus_Q_T[i] + bounds_cost
 
     def l_ux(self, x, u, i, terminal=False):

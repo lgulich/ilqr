@@ -99,7 +99,7 @@ class iLQR(BaseController):
 
         super(iLQR, self).__init__()
 
-    def initWithLqr(self, k, K, N, x0, x_set):
+    def init_with_lqr(self, k, K, N, x0, x_set):
         action_size = self.dynamics.action_size
         state_size = self.dynamics.state_size
 
@@ -110,12 +110,13 @@ class iLQR(BaseController):
         us = np.zeros((N, action_size))
 
         for i in range(self.N):
-            us[i] = us[i] + k + K.dot(x - x_set)
+            # us[i] = us[i] + k + K.dot(x - x_set)
+            us[i] = k + K @ (x - x_set)
             x = self.dynamics.f(x, us[i], i)
 
         return us
 
-    def linearizeAroundEquilibrium(self, x_eq, u_eq, n):
+    def linearize_around_equilibrium(self, x_eq, u_eq, n):
         """
         linearize the model around the equilibrium and return the optimal feedback and feedforward matrices
 
@@ -132,8 +133,8 @@ class iLQR(BaseController):
         assert x_eq.shape[0] == self.dynamics.state_size, "x_eq of wrong shape"
         assert u_eq.shape[0] == self.dynamics.action_size, "u_eq of wrong shape"
         assert n < self.N, "n too big"
-        assert np.array_equal(x_eq, self.dynamics.f(
-            x_eq, u_eq, n)), "not in an euilibrium state"
+        assert np.allclose(x_eq, self.dynamics.f(x_eq, u_eq, n)), \
+            f'not in an euilibrium state, {x_eq} vs {self.dynamics.f(x_eq, u_eq, n)}'
 
         us = np.tile(u_eq, (self.N, 1))
 
@@ -145,8 +146,6 @@ class iLQR(BaseController):
                                    F_xx, F_ux, F_uu)
 
         return k[n], K[n]
-        # np.savetxt('k_ff.csv', k[50], delimiter=',')
-        # np.savetxt('K_fb.csv', K[50], delimiter=',')
 
     def fit(self, x0, us_init, n_iterations=100, tol=1e-6, abs_tol=200, on_iteration=None, interim_log=False):
         """Computes the optimal controls.
@@ -274,7 +273,7 @@ class iLQR(BaseController):
         self._nominal_xs = xs
         self._nominal_us = us
 
-        return xs, us, Ls
+        return xs, us, Ls, k, K
 
     def _control(self, xs, us, k, K, alpha=1.0):
         """Applies the controls for a given trajectory.
@@ -297,8 +296,6 @@ class iLQR(BaseController):
 
         for i in range(self.N):
             # Eq (12).
-            # Applying alpha only on k[i] as in the paper for some reason
-            # doesn't converge.
             us_new[i] = us[i] + alpha * k[i] + K[i].dot(xs_new[i] - xs[i])
 
             # Eq (8c).
@@ -389,9 +386,15 @@ class iLQR(BaseController):
                 F_ux[i] = self.dynamics.f_ux(x, u, i)
                 F_uu[i] = self.dynamics.f_uu(x, u, i)
 
-        # parallelized forward evaluation of linearization
-        res = Parallel(n_jobs=self.n_jobs)(delayed(self._forward_rollout_core)(
-            xs[i], us[i], i) for i in range(N))
+        if self.n_jobs > 1:
+            # parallelized forward evaluation of linearization
+            res = Parallel(n_jobs=self.n_jobs)(delayed(self._forward_rollout_core)(
+                xs[i], us[i], i) for i in range(N))
+
+        else:
+            # unparallelized forward evalution of linearization
+            res = [self._forward_rollout_core(
+                xs[i], us[i], i) for i in range(N)]
 
         # unpack linmodparams object
         for i in range(N):
@@ -406,6 +409,7 @@ class iLQR(BaseController):
 
     def _forward_rollout_core(self, x, u, i):
         """
+        Linearize the system around a specific time and spatial point
         in: x, u
         out: F_x, F_u, L, L_x, L_u, L_xx, L_ux, L_uu
         """
@@ -491,7 +495,7 @@ class iLQR(BaseController):
 
         return np.array(k), np.array(K)
 
-    def getControlMatrices(self):
+    def get_control_matrices(self):
         return self._k, self._K
 
     def _Q(self,
@@ -554,23 +558,33 @@ class iLQR(BaseController):
         return Q_x, Q_u, Q_xx, Q_ux, Q_uu
 
     @staticmethod
-    def saveTrajForRos(xs, us, dt, fname):
+    def save_traj_for_ros(xs, us, ks, Ks, dt, fname):
         """
         filestructure:
         ts, x1s, x2s , ... , u1s u2s
         -------
-        0, 1.5
-        0.1, 1.6
-        0.2, 1.7
         """
-
+        header = 't, x, y, h, theta, phi, x-dot, y-dot, h-dot, theta-dot, phi-dot, piston-force, wheel-torque, k, K'
         N = us.shape[0]
         t_s = np.arange(0, dt * N, dt).reshape((N, 1))
+        x_s = xs[:-1, :].reshape((N, 10))
+        u_s = us.reshape((N, 2))
+        k_s = ks.reshape((N, 2))
+        K_s = Ks.reshape((N, 20), order='C')
 
-        # print(t_s, h_s, hip_torque_s)
-        all = np.concatenate((t_s, xs[:-1, :], us), axis=1)
+        assert(Ks[0, 0, 0] == K_s[0, 0])
+        assert(Ks[0, 0, 1] == K_s[0, 1])
+        assert(Ks[0, 0, 2] == K_s[0, 2])
+        assert(Ks[0, 1, 0] == K_s[0, 10])
 
-        np.savetxt(fname, all, delimiter=',')
+        assert(Ks[N - 21, 0, 0] == K_s[N - 21, 0])
+        assert(Ks[N - 21, 0, 1] == K_s[N - 21, 1])
+        assert(Ks[N - 21, 0, 2] == K_s[N - 21, 2])
+        assert(Ks[N - 21, 1, 0] == K_s[N - 21, 10])
+
+        out = np.concatenate((t_s, x_s, u_s, k_s, K_s), axis=1)
+
+        np.savetxt(fname, out, delimiter=',', header=header)
 
         return
 

@@ -18,11 +18,12 @@ import abc
 
 import numpy as np
 import six
-import theano.tensor as T
 from scipy.linalg import block_diag
 from scipy.optimize import approx_fprime
 
-from autodiff import as_function, hessian_scalar, jacobian_scalar
+import theano.tensor as T
+
+from .autodiff import as_function, hessian_scalar, jacobian_scalar
 
 
 @six.add_metaclass(abc.ABCMeta)
@@ -1548,9 +1549,9 @@ class TimeDependentLogBoundedPathQRCost(Cost):
         for i in range(path_length):
             for j in range(state_size):
                 bound_costs[i, j] += self.log_barrier(
-                    xs[i, j], self.x_u_bounds[j], 1)
+                    xs[i, j], self.x_u_bounds[j], +1, self.Q_bound[j, j])
                 bound_costs[i, j] += self.log_barrier(
-                    xs[i, j], self.x_l_bounds[j], -1)
+                    xs[i, j], self.x_l_bounds[j], -1, self.Q_bound[j, j])
 
         all_costs[:, state_size + action_size:] = bound_costs
 
@@ -1782,3 +1783,132 @@ class TimeDependentLogBoundedPathQRCost(Cost):
             return np.zeros_like(self.Rs[0])
 
         return self._R_plus_R_T[i]
+
+
+class AllTimeDependentLogBoundedPathQRCost(TimeDependentLogBoundedPathQRCost):
+    """Quadratic Regulator Instantaneous Cost for trajectory following."""
+
+    def __init__(self, Qs, Rs, x_path, x_l_bounds, x_u_bounds, Q_bound, u_path=None):
+        """Constructs a QRCost.
+
+        Args:
+            Q: Quadratic state cost matrix [N+1, state_size, state_size].
+            R: Quadratic control cost matrix [N, action_size, action_size].
+            x_path: Goal state path [N+1, state_size].
+            x_l_bounds: Lower bounds for state [N+1, state_size].
+            x_u_bounds: Upper bounds for state [N+1, state_size].
+            Q_bound: Quadratic state cost matrix for outside bounds [N+1, state_size, state_size].
+            u_path: Goal control path [N, action_size].
+        """
+        self.Qs = np.array(Qs)
+        self.Rs = np.array(Rs)
+        self.x_path = np.array(x_path)
+        self.x_l_bounds = np.array(x_l_bounds)
+        self.x_u_bounds = np.array(x_u_bounds)
+        self.Q_bound = np.array(Q_bound)
+
+        state_size = self.Qs.shape[1]
+        action_size = self.Rs.shape[1]
+        path_length = self.x_path.shape[0]
+
+        if u_path is None:
+            self.u_path = np.zeros((path_length - 1, action_size))
+        else:
+            self.u_path = np.array(u_path)
+
+        assert self.Qs.shape[1] == self.Qs.shape[2], "Q must be square"
+        assert self.Rs.shape[1] == self.Rs.shape[2], "R must be square"
+        assert self.Q_bound.shape[1] == self.Q_bound.shape[2], "Q bound must be square"
+        assert state_size == self.x_path.shape[1], "Q & x_path mismatch"
+        assert state_size == self.Q_bound.shape[1], "Q_bound must be of same dimension as Q"
+        assert state_size == self.x_l_bounds.shape[1], "x_l_bounds must be of dimension state_size"
+        assert state_size == self.x_u_bounds.shape[1], "x_u_bounds must be of dimension state_size"
+        assert action_size == self.u_path.shape[1], "R & u_path mismatch"
+        assert path_length == self.u_path.shape[0] + \
+            1, "x_path must be 1 longer than u_path"
+        assert path_length == self.Qs.shape[0], "Q must be of size (N+1, n_x, n_x)"
+        assert path_length == self.Q_bound.shape[0], "Q must be of size (N+1, n_x, n_x)"
+        assert path_length == self.x_l_bounds.shape[
+            0], "Q must be of size (N+1, n_x, n_x)"
+        assert path_length == self.x_u_bounds.shape[
+            0], "Q must be of size (N+1, n_x, n_x)"
+
+        assert path_length == self.Rs.shape[0] + \
+            1, "R must be of size (N, n_u, n_u)"
+
+        # Precompute some common constants.
+        self._Q_plus_Q_T = self.Qs + np.transpose(self.Qs, (0, 2, 1))
+        self._Q_plus_Q_T_bound = self.Q_bound + \
+            np.transpose(self.Q_bound, (0, 2, 1))
+        self._R_plus_R_T = self.Rs + np.transpose(self.Rs, (0, 2, 1))
+        # super(AllTimeDependentLogBoundedPathQRCost, self).__init__()
+
+    def getCostSequence(self, xs, us, Ls):
+        state_size = self.Qs.shape[-1]
+        action_size = self.Rs.shape[-1]
+        path_length = self.x_path.shape[0]
+        all_costs = np.zeros((path_length, 2 * state_size + action_size))
+        x_diff = xs - self.x_path
+
+        # get seperate costs of each state
+        for i in range(state_size):
+            all_costs[:, i] = x_diff[:, i]**2 * self.Qs[:, i, i]
+
+        # get seperate costs of each input
+        for i in range(action_size):
+            all_costs[:-1, i +
+                      state_size] = us[:, i]**2 * self.Rs[:, i, i]
+
+        # get seperate costs of each input for the boundary restriction
+        bound_costs = np.zeros((path_length, state_size))
+        for i in range(path_length):
+            for j in range(state_size):
+                bound_costs[i, j] += self.log_barrier(
+                    xs[i, j], self.x_u_bounds[i, j], +1, self.Q_bound[i, j, j])
+                bound_costs[i, j] += self.log_barrier(
+                    xs[i, j], self.x_l_bounds[i, j], -1, self.Q_bound[i, j, j])
+
+        all_costs[:, state_size + action_size:] = bound_costs
+
+        # prepend total costs to individual costs
+        all_costs = np.concatenate(
+            (Ls.reshape(path_length, 1), all_costs), axis=1)
+
+        return all_costs
+
+    def bounds_cost(self, x, u, i, terminal=False):
+        state_size = self.Qs.shape[1]
+        bounds_cost = 0.0
+        for j in range(state_size):
+            bounds_cost += self.log_barrier(x[j],
+                                            self.x_u_bounds[i, j], +1, self.Q_bound[i, j, j])
+            bounds_cost += self.log_barrier(x[j],
+                                            self.x_l_bounds[i, j], -1, self.Q_bound[i, j, j])
+            # assert not np.isnan(bounds_cost), f'found nan in l: {x[i]} {self.x_l_bounds[i, i]} {self.x_u_bounds[i]}'
+            assert not np.isnan(bounds_cost)
+        return bounds_cost
+
+    def bounds_cost_x(self, x, u, i, terminal=False):
+        state_size = self.Qs.shape[1]
+        bounds_cost = np.zeros((state_size,))
+
+        for j in range(state_size):
+            bounds_cost[j] += self.log_barrier_x(x[j],
+                                                 self.x_u_bounds[i, j], +1, self.Q_bound[i, j, j])
+            bounds_cost[j] += self.log_barrier_x(x[j],
+                                                 self.x_l_bounds[i, j], -1, self.Q_bound[i, j, j])
+            assert not np.isnan(bounds_cost[j]), "found nan in l_x"
+
+        return bounds_cost
+
+    def bounds_cost_xx(self, x, u, i, terminal=False):
+        state_size = self.Qs.shape[1]
+        bounds_cost = np.zeros((state_size, state_size))
+        for j in range(state_size):
+            bounds_cost[j, j] += self.log_barrier_xx(
+                x[j], self.x_u_bounds[i, j], +1, self.Q_bound[i, j, j])
+            bounds_cost[j, j] += self.log_barrier_xx(
+                x[j], self.x_l_bounds[i, j], -1, self.Q_bound[i, j, j])
+            assert not np.isnan(bounds_cost[j, j]), "found nan in l_xx"
+
+        return bounds_cost

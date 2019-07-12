@@ -211,12 +211,6 @@ class iLQR(BaseController):
                 k, K = self._backward_pass(F_x, F_u, L_x, L_u, L_xx, L_ux, L_uu,
                                            F_xx, F_ux, F_uu)
 
-                # save k and K if needed
-                # if iteration == 0:
-                #     np.savetxt('k_ff.csv', k[50], delimiter=',')
-                #     np.savetxt('K_fb.csv', K[50], delimiter=',')
-                # asd
-
                 # Backtracking line search.
                 for alpha in alphas:
                     xs_new, us_new = self._control(xs, us, k, K, alpha)

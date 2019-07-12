@@ -18,10 +18,9 @@ import abc
 
 import numpy as np
 import six
+import theano.tensor as T
 from scipy.linalg import block_diag
 from scipy.optimize import approx_fprime
-
-import theano.tensor as T
 
 from .autodiff import as_function, hessian_scalar, jacobian_scalar
 
